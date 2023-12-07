@@ -1,10 +1,3 @@
-"""
-you give this script some words (one per line) and it will generate more things like it.
-uses super state of the art Transformer AI tech
-this code is intended to be super hackable. tune it to your needs.
-
-"""
-
 import os
 import sys
 import time
@@ -12,13 +5,17 @@ import math
 import argparse
 from dataclasses import dataclass
 from typing import List
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
+from collections import Counter
+import pandas as pd
+import seaborn as sns
+from sklearn.manifold import TSNE
 
 # -----------------------------------------------------------------------------
 
@@ -33,6 +30,7 @@ class ModelConfig:
     n_head: int = 4
 
 # -----------------------------------------------------------------------------
+
 # Transformer Language Model (*exactly* as used in GPT-2)
 
 class NewGELU(nn.Module):
@@ -81,7 +79,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.c_proj(y)
-        return y
+        return y, att
 
 class Block(nn.Module):
     """ an unassuming Transformer block """
@@ -99,10 +97,22 @@ class Block(nn.Module):
         m = self.mlp
         self.mlpf = lambda x: m.c_proj(m.act(m.c_fc(x))) # MLP forward
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlpf(self.ln_2(x))
-        return x
+    # def forward(self, x):
+    #     x = x + self.attn(self.ln_1(x))
+    #     x = x + self.mlpf(self.ln_2(x))
+    #     return x
+    def forward(self, x, return_attention=False):
+        x1 = self.ln_1(x)
+        attn_output, attn_weights = self.attn(x1)
+        x = x + attn_output
+
+        x2 = self.ln_2(x)
+        x = x + self.mlpf(x2)
+
+        if return_attention:
+            return x, attn_weights
+        else:
+            return x
 
 class Transformer(nn.Module):
     """ Transformer Language Model, exactly as seen in GPT-2 """
@@ -123,6 +133,8 @@ class Transformer(nn.Module):
         n_params = sum(p.numel() for p in self.transformer.parameters())
         print("number of parameters: %.2fM" % (n_params/1e6,))
 
+        self.dropout = nn.Dropout(p=0.1)
+
     def get_block_size(self):
         return self.block_size
 
@@ -130,23 +142,98 @@ class Transformer(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        # Get embeddings
+        tok_emb = self.transformer['wte'](idx)  # Token embeddings
+        pos_emb = self.transformer['wpe'](torch.arange(t, device=device))  # Positional embeddings
         x = tok_emb + pos_emb
-        for block in self.transformer.h:
+
+        # Apply dropout after adding positional embeddings
+        x = self.dropout(x)
+
+        # Pass through transformer blocks
+        for block in self.transformer['h']:
             x = block(x)
-        x = self.transformer.ln_f(x)
+
+        # Final layer normalization and linear transformation
+        x = self.transformer['ln_f'](x)
         logits = self.lm_head(x)
 
-        # if we are given some desired targets also calculate the loss
+        # Calculate loss if targets are provided
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
         return logits, loss
+
+def visualize_embedding_space_tf(model, dataset):
+    embeddings = model.transformer['wte'].weight.detach().cpu().numpy()
+
+    # Adjust perplexity based on the number of embeddings
+    perplexity_value = min(30, len(embeddings) - 1)
+    
+    tsne = TSNE(n_components=2, perplexity=perplexity_value, random_state=0)
+    reduced_embeddings = tsne.fit_transform(embeddings)
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1], c='blue', alpha=0.5)
+    for i, char in enumerate(dataset.chars):
+        plt.annotate(char, (reduced_embeddings[i, 0], reduced_embeddings[i, 1]))
+    plt.xlabel("t-SNE Component 1")
+    plt.ylabel("t-SNE Component 2")
+    plt.title("Character Embedding Space Visualized with t-SNE")
+    plt.show()
+
+def visualize_attention_tf(model, dataset, names, layer_num=0, head_num=0):
+    """
+    Visualize attention weights for multiple names, for a specific layer and head.
+    Args:
+    - model: The transformer model object.
+    - dataset: The dataset object with stoi mapping.
+    - names: List of name strings for which to visualize attention.
+    - layer_num: The layer number to visualize.
+    - head_num: The head number within the layer to visualize.
+    """
+    for name in names:
+        input_idx = torch.tensor([[dataset.stoi.get(char, 0) for char in name]], dtype=torch.long)
+        x = model.transformer['wte'](input_idx) + model.transformer['wpe'](torch.arange(0, input_idx.size(-1), device=input_idx.device))
+        for i, block in enumerate(model.transformer['h']):
+            if i == layer_num:
+                x, attn = block(x, return_attention=True)  # Get attention weights
+                attn = attn[0, head_num].detach().cpu().numpy()
+                break
+            else:
+                x = block(x)
+
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(attn, annot=True, fmt=".2f", cmap='viridis', xticklabels=name, yticklabels=name)
+        plt.title(f"Layer {layer_num} - Head {head_num} Attention Weights for '{name}'")
+        plt.xlabel("Key")
+        plt.ylabel("Query")
+        plt.show()
+
+def visualize_output_distribution_tf(model, dataset, names):
+    """
+    Visualize the output probability distribution for multiple names.
+    Args:
+    - model: The transformer model object.
+    - dataset: The dataset object with stoi mapping.
+    - names: List of name strings for which to visualize output distribution.
+    """
+    model.eval()
+    for name in names:
+        input_idx = torch.tensor([[dataset.stoi.get(char, 0) for char in name]], dtype=torch.long)
+        with torch.no_grad():
+            logits, _ = model(input_idx)
+            probs = F.softmax(logits, dim=-1)
+            probs = probs[0, -1].detach().cpu().numpy()
+
+        plt.figure(figsize=(12, 6))
+        plt.bar(range(len(probs)), probs)
+        plt.xlabel('Token ID')
+        plt.ylabel('Probability')
+        plt.title(f'Output Probability Distribution for "{name}"')
+        plt.show()
 
 # -----------------------------------------------------------------------------
 """
@@ -242,6 +329,85 @@ class RNN(nn.Module):
 
         return logits, loss
 
+def visualize_hidden_activations_rnn(model, dataset, names):
+    model.eval()
+    max_length = model.get_block_size()  # Maximum length of the input sequence
+    for name in names:
+        # Encode the name and pad to the maximum length
+        input_idx = [dataset.stoi[char] for char in name] + [0] * (max_length - len(name))
+        input_tensor = torch.tensor([input_idx], dtype=torch.long).to(args.device)
+
+        # Forward pass through the embedding layer
+        embeddings = model.wte(input_tensor)
+
+        # Initialize hidden state and collect activations
+        hprev = model.start.expand((1, -1))  # Initial hidden state
+        activations = []
+        for i in range(max_length):
+            xt = embeddings[:, i, :]  # (1, n_embd)
+            ht = model.cell(xt, hprev)  # (1, n_embd2)
+            hprev = ht
+            activations.append(ht.detach().cpu().numpy().flatten())
+
+        # Plot the activations
+        plt.figure(figsize=(12, 6))
+        sns.heatmap(activations, cmap='viridis')
+        plt.title(f"Hidden Layer Activations for '{name}'")
+        plt.xlabel("Activation Units")
+        plt.ylabel("Timesteps")
+        plt.show()
+    model.train()
+
+def visualize_output_distribution_rnn(model, dataset, names):
+    model.eval()
+    for name in names:
+        # Encode the name into indices using the dataset's stoi mapping
+        input_idx = [dataset.stoi[char] for char in name] + [0] * (model.get_block_size() - len(name))
+        input_tensor = torch.tensor([input_idx], dtype=torch.long).to(args.device)
+
+        logits, _ = model(input_tensor)  # Get the logits from the model
+        probs = F.softmax(logits, dim=-1)  # Apply softmax to convert logits to probabilities
+
+        # Plot the last token's probabilities
+        plt.figure(figsize=(10, 6))
+        plt.bar(range(probs.size(-1)), probs[0, -1].detach().cpu().numpy())
+        plt.title(f"Probability Distribution of Next Token for '{name}'")
+        plt.xlabel("Token ID")
+        plt.ylabel("Probability")
+        plt.show()
+    model.train()
+
+def visualize_rnn_character_embeddings(model, dataset):
+    """
+    Visualizes the character embedding space of the RNN model using t-SNE.
+
+    Args:
+    - model: The trained RNN model.
+    - dataset: The dataset containing the character-to-index mapping.
+
+    This function plots a 2D scatter plot where each point represents a character
+    embedding in the reduced space.
+    """
+    # Extract the embeddings from the model
+    embeddings = model.wte.weight.detach().cpu().numpy()
+
+    # Set the perplexity value (can be tuned)
+    perplexity_value = min(30, len(embeddings) - 1)
+
+    # Use t-SNE to reduce the dimensionality of embeddings
+    tsne = TSNE(n_components=2, perplexity=perplexity_value, random_state=0)
+    reduced_embeddings = tsne.fit_transform(embeddings)
+
+    # Plotting
+    plt.figure(figsize=(10, 6))
+    plt.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1], c='blue', alpha=0.5)
+    for i, char in enumerate(dataset.chars):
+        plt.annotate(char, (reduced_embeddings[i, 0], reduced_embeddings[i, 1]))
+    plt.xlabel("t-SNE Component 1")
+    plt.ylabel("t-SNE Component 2")
+    plt.title("RNN Character Embedding Space Visualized with t-SNE")
+    plt.show()
+
 # -----------------------------------------------------------------------------
 # MLP language model
 
@@ -290,6 +456,78 @@ class MLP(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
         return logits, loss
+
+def visualize_embedding_space(model, dataset):
+    embeddings = model.wte.weight.detach().cpu().numpy()
+
+    # Adjust perplexity based on the number of embeddings
+    perplexity_value = min(30, len(embeddings) - 1)
+    
+    tsne = TSNE(n_components=2, perplexity=perplexity_value, random_state=0)
+    reduced_embeddings = tsne.fit_transform(embeddings)
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1], c='blue', alpha=0.5)
+    for i, char in enumerate(dataset.chars):
+        plt.annotate(char, (reduced_embeddings[i, 0], reduced_embeddings[i, 1]))
+    plt.xlabel("t-SNE Component 1")
+    plt.ylabel("t-SNE Component 2")
+    plt.title("Character Embedding Space Visualized with t-SNE")
+    plt.show()
+
+def visualize_hidden_activations(model, dataset, names):
+    model.eval()
+    max_length = model.block_size  # Maximum length of the input sequence
+    for name in names:
+        # Encode the name and pad to the maximum length
+        input_idx = [dataset.stoi[char] for char in name] + [0] * (max_length - len(name))
+        input_tensor = torch.tensor([input_idx], dtype=torch.long).to(args.device)
+
+        # Forward pass through the embedding layer
+        embeddings = model.wte(input_tensor)
+
+        # The input to the first linear layer should now have the correct shape
+        hidden_activations = model.mlp[0](embeddings.view(embeddings.size(0), -1))
+
+        # Plot the histogram
+        plt.figure(figsize=(10, 6))
+        plt.hist(hidden_activations.detach().cpu().numpy().flatten(), bins=30, color='green', alpha=0.7)
+        plt.title(f"Histogram of Activations in the Hidden Layer for '{name}'")
+        plt.xlabel("Activation")
+        plt.ylabel("Frequency")
+        plt.show()
+    model.train()
+
+def visualize_output_distribution(model, dataset, names):
+    model.eval()
+    for name in names:
+        # Encode the name into indices using the dataset's stoi mapping
+        input_idx = torch.tensor([dataset.stoi[char] for char in name], dtype=torch.long).unsqueeze(0).to(args.device)
+
+        logits = model(input_idx)[0]  # Get the logits from the model
+        probs = F.softmax(logits, dim=-1)  # Apply softmax to convert logits to probabilities
+
+        plt.figure(figsize=(10, 6))
+        plt.bar(range(probs.size(-1)), probs[0, -1].detach().cpu().numpy())  # Plot the last token's probabilities
+        plt.title(f"Probability Distribution of Next Token for '{name}'")
+        plt.xlabel("Token ID")
+        plt.ylabel("Probability")
+        plt.show()
+    model.train()
+
+def prepare_input(sequence, char_dataset):
+    """
+    Encodes a given sequence of characters into a tensor of indices.
+    Args:
+    - sequence (str): A string of characters to encode.
+    - char_dataset (CharDataset): The dataset object containing character-to-index mapping.
+    
+    Returns:
+    - torch.Tensor: A tensor representing the encoded sequence.
+    """
+    encoded_sequence = [char_dataset.stoi[char] for char in sequence]
+    return torch.tensor([encoded_sequence], dtype=torch.long)
+
 
 # -----------------------------------------------------------------------------
 # Bigram language model
@@ -401,6 +639,135 @@ def evaluate(model, dataset, batch_size=50, max_batches=None):
 # -----------------------------------------------------------------------------
 # helper functions for creating the training and test Datasets that emit words
 
+def plot_name_length_distribution(file_path):
+    with open(file_path, 'r') as file:
+        names = file.readlines()
+    names = [name.strip() for name in names if name.strip()]
+    name_lengths = [len(name) for name in names]
+    
+    plt.figure(figsize=(10,6))
+    plt.hist(name_lengths, bins=range(min(name_lengths), max(name_lengths) + 1, 1), color='skyblue', edgecolor='black')
+    plt.xlabel('Name Length')
+    plt.ylabel('Frequency')
+    plt.title('Distribution of Name Lengths in Dataset')
+    plt.xticks(range(min(name_lengths), max(name_lengths) + 1))
+    plt.show()
+
+def plot_character_distribution(file_path):
+    with open(file_path, 'r') as file:
+        names = file.readlines()
+    names = [name.strip() for name in names if name.strip()]
+    all_characters = ''.join(names)
+    
+    char_count = Counter(all_characters)
+    df = pd.DataFrame(char_count.items(), columns=['Character', 'Frequency']).sort_values('Frequency', ascending=False)
+
+    plt.figure(figsize=(10,6))
+    plt.bar(df['Character'], df['Frequency'], color='skyblue')
+    plt.xlabel('Character')
+    plt.ylabel('Frequency')
+    plt.title('Character Distribution in Dataset')
+    plt.show()
+
+def create_bigram_heatmap(file_path):
+    with open(file_path, 'r') as file:
+        text = file.read().replace('\n', '').lower()
+
+    # Create bigrams from the text
+    bigrams = [text[i:i+2] for i in range(len(text)-1)]
+    bigram_counts = Counter(bigrams)
+
+    # Create a dataframe from bigrams
+    bigram_df = pd.DataFrame.from_dict(bigram_counts, orient='index').reset_index()
+    bigram_df = bigram_df.rename(columns={'index':'bigram', 0:'count'})
+    bigram_df['first_char'] = bigram_df['bigram'].apply(lambda x: x[0])
+    bigram_df['second_char'] = bigram_df['bigram'].apply(lambda x: x[1])
+
+    pivot_table = bigram_df.pivot(index='first_char', columns='second_char', values='count')
+    pivot_table = pivot_table.fillna(0)
+
+    plt.figure(figsize=(10,10))
+    sns.heatmap(pivot_table, annot=False, cmap="YlGnBu")
+    plt.title("Bigram Frequencies")
+    plt.show()
+
+def plot_common_bigrams(file_path, num_bigrams=10):
+    with open(file_path, 'r') as file:
+        text = file.read().replace('\n', '').lower()
+
+    # Create bigrams from the text
+    bigrams = [text[i:i+2] for i in range(len(text)-1)]
+    bigram_counts = Counter(bigrams).most_common(num_bigrams)
+
+    # Convert to DataFrame for easier plotting
+    bigram_df = pd.DataFrame(bigram_counts, columns=['Bigram', 'Frequency'])
+
+    plt.figure(figsize=(10,6))
+    sns.barplot(x='Frequency', y='Bigram', data=bigram_df, palette="Blues_d")
+    plt.title(f'Top {num_bigrams} Most Common Bigrams')
+    plt.show()
+
+def plot_training_progress(log_file_path):
+    with open(log_file_path, 'r') as file:
+        lines = file.readlines()
+
+    steps, losses, times = [], [], []
+    for line in lines:
+        if 'step' in line and 'loss' in line and not 'train loss' in line:
+            parts = line.split('|')
+            step = int(parts[0].split()[1])
+            loss = float(parts[1].split()[1])
+            time_str = parts[2].split()[2]  # Extracting the time as a string
+            time = float(time_str.replace('ms', ''))  # Removing the 'ms' and converting to float
+
+            steps.append(step)
+            losses.append(loss)
+            times.append(time)
+
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(steps, losses, label='Training Loss', color='blue')
+    plt.xlabel('Steps')
+    plt.ylabel('Loss')
+    plt.title('Training Loss')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(steps, times, label='Step Time', color='red')
+    plt.xlabel('Steps')
+    plt.ylabel('Time (ms)')
+    plt.title('Step Time')
+
+    plt.tight_layout()
+    plt.show()
+
+def plot_evaluation_progress(log_file_path):
+    # Read the log file
+    with open(log_file_path, 'r') as file:
+        lines = file.readlines()
+
+    eval_steps, train_losses, test_losses = [], [], []
+    for line in lines:
+        if 'train loss' in line and 'test loss' in line:
+            parts = line.split()
+            step = int(parts[1])
+            train_loss = float(parts[4])
+            test_loss = float(parts[7])
+
+            eval_steps.append(step)
+            train_losses.append(train_loss)
+            test_losses.append(test_loss)
+
+    # Plotting Evaluation Loss
+    plt.figure(figsize=(12, 6))
+    plt.plot(eval_steps, train_losses, label='Train Loss', color='blue')
+    plt.plot(eval_steps, test_losses, label='Test Loss', color='green')
+    plt.xlabel('Steps')
+    plt.ylabel('Loss')
+    plt.title('Evaluation Loss')
+    plt.legend()
+
+    plt.show()
+
 class CharDataset(Dataset):
 
     def __init__(self, words, chars, max_word_length):
@@ -506,13 +873,13 @@ if __name__ == '__main__':
     parser.add_argument('--top-k', type=int, default=-1, help="top-k for sampling, -1 means no top-k")
     # model
     parser.add_argument('--type', type=str, default='transformer', help="model class type to use, bigram|mlp|rnn|gru|bow|transformer")
-    parser.add_argument('--n-layer', type=int, default=4, help="number of layers")
+    parser.add_argument('--n-layer', type=int, default=2, help="number of layers")
     parser.add_argument('--n-head', type=int, default=4, help="number of heads (in a transformer)")
-    parser.add_argument('--n-embd', type=int, default=64, help="number of feature channels in the model")
-    parser.add_argument('--n-embd2', type=int, default=64, help="number of feature channels elsewhere in the model")
+    parser.add_argument('--n-embd', type=int, default=32, help="number of feature channels in the model")
+    parser.add_argument('--n-embd2', type=int, default=32, help="number of feature channels elsewhere in the model")
     # optimization
     parser.add_argument('--batch-size', '-b', type=int, default=32, help="batch size during optimization")
-    parser.add_argument('--learning-rate', '-l', type=float, default=5e-4, help="learning rate")
+    parser.add_argument('--learning-rate', '-l', type=float, default=7e-4, help="learning rate")
     parser.add_argument('--weight-decay', '-w', type=float, default=0.01, help="weight decay")
     args = parser.parse_args()
     print(vars(args))
@@ -529,22 +896,42 @@ if __name__ == '__main__':
     block_size = train_dataset.get_output_length()
     print(f"dataset determined that: {vocab_size=}, {block_size=}")
 
+    # dataset visualsation
+    # plot_character_distribution(args.input_file)
+    # plot_name_length_distribution(args.input_file)
+
+    # logging visualisation
+    plot_training_progress(args.work_dir+'/training_log.txt')
+    plot_evaluation_progress(args.work_dir+'/training_log.txt')
+
+    # Example names from the dataset
+    mlp_selected_names = ["charlotte", "zoe", "alexandria", "jacqueline"]  # Replace with names from your dataset
+
     # init model
     config = ModelConfig(vocab_size=vocab_size, block_size=block_size,
                        n_layer=args.n_layer, n_head=args.n_head,
                        n_embd=args.n_embd, n_embd2=args.n_embd2)
     if args.type == 'transformer':
         model = Transformer(config)
+        # visualize_embedding_space_tf(model, train_dataset)
+        # visualize_attention_tf(model, train_dataset, mlp_selected_names)
+        # visualize_output_distribution_tf(model, train_dataset, mlp_selected_names)
     elif args.type == 'bigram':
         model = Bigram(config)
+        # create_bigram_heatmap(args.input_file)
+        # plot_common_bigrams(args.input_file)
     elif args.type == 'mlp':
         model = MLP(config)
+        # visualize_embedding_space(model, train_dataset)
+        # visualize_hidden_activations(model, train_dataset, mlp_selected_names)
+        # visualize_output_distribution(model, train_dataset, mlp_selected_names)
     elif args.type == 'rnn':
         model = RNN(config, cell_type='rnn')
+        # visualize_rnn_character_embeddings(model, train_dataset)
+        # visualize_hidden_activations_rnn(model, train_dataset, mlp_selected_names)
+        # visualize_output_distribution_rnn(model, train_dataset, mlp_selected_names)
     elif args.type == 'gru':
         model = RNN(config, cell_type='gru')
-    elif args.type == 'bow':
-        model = BoW(config)
     else:
         raise ValueError(f'model type {args.type} is not recognized')
     model.to(args.device)
@@ -562,9 +949,14 @@ if __name__ == '__main__':
     # init dataloader
     batch_loader = InfiniteDataLoader(train_dataset, batch_size=args.batch_size, pin_memory=True, num_workers=args.num_workers)
 
+    # Open a log file
+    log_file_path = os.path.join(args.work_dir, "training_log.txt")
+    log_file = open(log_file_path, "a")
+
     # training loop
     best_loss = None
     step = 0
+
     while True:
 
         t0 = time.time()
@@ -589,20 +981,28 @@ if __name__ == '__main__':
 
         # logging
         if step % 10 == 0:
-            print(f"step {step} | loss {loss.item():.4f} | step time {(t1-t0)*1000:.2f}ms")
+            log_message = f"step {step} | loss {loss.item():.4f} | step time {(t1-t0)*1000:.2f}ms"
+            print(log_message)
+            log_file.write(log_message + '\n')
 
-        # evaluate the model
+        # evaluate the model every 500 steps and log the results
         if step > 0 and step % 500 == 0:
             train_loss = evaluate(model, train_dataset, batch_size=100, max_batches=10)
             test_loss  = evaluate(model, test_dataset,  batch_size=100, max_batches=10)
             writer.add_scalar("Loss/train", train_loss, step)
             writer.add_scalar("Loss/test", test_loss, step)
             writer.flush()
-            print(f"step {step} train loss: {train_loss} test loss: {test_loss}")
+
+            eval_log_message = f"step {step} train loss: {train_loss} test loss: {test_loss}"
+            print(eval_log_message)
+            log_file.write(eval_log_message + '\n')
+
             # save the model to disk if it has improved
             if best_loss is None or test_loss < best_loss:
                 out_path = os.path.join(args.work_dir, "model.pt")
-                print(f"test loss {test_loss} is the best so far, saving model to {out_path}")
+                save_message = f"test loss {test_loss} is the best so far, saving model to {out_path}"
+                print(save_message)
+                log_file.write(save_message + '\n')
                 torch.save(model.state_dict(), out_path)
                 best_loss = test_loss
 
@@ -614,3 +1014,5 @@ if __name__ == '__main__':
         # termination conditions
         if args.max_steps >= 0 and step >= args.max_steps:
             break
+    
+    log_file.close()
